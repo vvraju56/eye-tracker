@@ -14,6 +14,7 @@ import { calculateEyeAspectRatio } from "../utils/blinkDetector";
 import type { BlinkData } from "../utils/blinkDetector";
 import { estimateHeadPose } from "../utils/headPose";
 import type { HeadPoseData } from "../utils/headPose";
+import { createSession, endSession, logFocus, getDeviceId } from "../utils/api";
 
 export interface TrackingState {
   isRunning: boolean;
@@ -27,6 +28,8 @@ export interface TrackingState {
   gazePosition: { x: number; y: number } | null;
   showLandmarks: boolean;
   isCalibrated: boolean;
+  sessionId: number | null;
+  connected: boolean;
 }
 
 const INITIAL_STATE: TrackingState = {
@@ -41,6 +44,8 @@ const INITIAL_STATE: TrackingState = {
   gazePosition: null,
   showLandmarks: true,
   isCalibrated: false,
+  sessionId: null,
+  connected: false,
 };
 
 const DISTRACTION_THRESHOLD = 1.0;
@@ -51,6 +56,7 @@ const V_GAZE_ONSCREEN_MAX = 0.75;
 const EYE_OPEN_THRESHOLD = 0.15;
 const MAX_HEAD_YAW = 22;
 const MAX_HEAD_PITCH = 20;
+const LOG_INTERVAL = 1000;
 
 export function useEyeTracker() {
   const [state, setState] = useState<TrackingState>(INITIAL_STATE);
@@ -63,6 +69,9 @@ export function useEyeTracker() {
   const frameCountRef = useRef<number>(0);
   const fpsTimeRef = useRef<number>(0);
   const distractionTimerRef = useRef<number>(0);
+  const focusStartTimeRef = useRef<number>(0);
+  const lastLogTimeRef = useRef<number>(0);
+  const deviceIdRef = useRef<string>("");
 
   const initFaceLandmarker = useCallback(async () => {
     const filesetResolver = await FilesetResolver.forVisionTasks(
@@ -83,21 +92,14 @@ export function useEyeTracker() {
   const startCamera = useCallback(async () => {
     try {
       console.log("Requesting camera access...");
-      
+
       const devices = await navigator.mediaDevices.enumerateDevices();
-      console.log("All devices:", devices.map(d => ({ 
-        kind: d.kind, 
-        label: d.label || 'no-label',
-        deviceId: d.deviceId.substring(0, 20) + '...'
-      })));
-      
       const videoDevices = devices.filter(d => d.kind === "videoinput");
-      console.log(`Video devices found: ${videoDevices.length}`);
-      
+
       if (videoDevices.length === 0) {
         throw new Error("No camera detected");
       }
-      
+
       const stream = await navigator.mediaDevices.getUserMedia({
         video: {
           width: { min: 640, ideal: 1280, max: 1920 },
@@ -105,7 +107,7 @@ export function useEyeTracker() {
           frameRate: { min: 15, ideal: 30 }
         }
       });
-      
+
       streamRef.current = stream;
 
       if (videoRef.current) {
@@ -117,6 +119,19 @@ export function useEyeTracker() {
         await initFaceLandmarker();
       }
 
+      deviceIdRef.current = getDeviceId();
+      let sessionId: number | null = null;
+      let connected = false;
+
+      try {
+        const session = await createSession(deviceIdRef.current);
+        sessionId = session.id;
+        connected = true;
+        console.log("Connected to backend, session:", sessionId);
+      } catch (err) {
+        console.warn("Backend not available, running in offline mode");
+      }
+
       setState((prev) => ({
         ...prev,
         isRunning: true,
@@ -124,9 +139,14 @@ export function useEyeTracker() {
         isDistracted: false,
         distractionReason: "",
         fps: 0,
+        sessionId,
+        connected,
       }));
+
       fpsTimeRef.current = Date.now();
       frameCountRef.current = 0;
+      focusStartTimeRef.current = Date.now();
+      lastLogTimeRef.current = Date.now();
 
       processFrame();
     } catch (err) {
@@ -144,14 +164,20 @@ export function useEyeTracker() {
     if (animationRef.current) {
       cancelAnimationFrame(animationRef.current);
     }
+
+    if (state.sessionId) {
+      endSession(state.sessionId).catch(console.error);
+    }
+
     setState((prev) => ({
       ...prev,
       isRunning: false,
       isFocusedNow: false,
       isDistracted: false,
       distractionReason: "",
+      sessionId: null,
     }));
-  }, []);
+  }, [state.sessionId]);
 
   const processFrame = useCallback(() => {
     const video = videoRef.current;
@@ -199,6 +225,7 @@ export function useEyeTracker() {
     let earData = { leftEar: 0, rightEar: 0, avgEar: 0 };
     let landmarks = null;
     let headPoseData: HeadPoseData | null = null;
+    let focusStatus: "focused" | "distracted" | "no_face" = "no_face";
 
     if (results.faceLandmarks && results.faceLandmarks.length > 0) {
       landmarks = results.faceLandmarks[0];
@@ -230,9 +257,6 @@ export function useEyeTracker() {
       );
       avgVGazeRatio = (leftVGazeRatio + rightVGazeRatio) / 2;
 
-      // Gaze detection - note: camera sees mirror image
-      // Looking LEFT (screen left) = iris moves RIGHT in video = HIGHER ratio
-      // Looking RIGHT (screen right) = iris moves LEFT in video = LOWER ratio
       hOnScreen =
         avgHGazeRatio > H_GAZE_ONSCREEN_MIN && avgHGazeRatio < H_GAZE_ONSCREEN_MAX;
       vOnScreen =
@@ -251,6 +275,8 @@ export function useEyeTracker() {
       if (!onScreen) reason = "LOOKING AWAY";
       else if (!centered) reason = "HEAD TURNED";
       else if (!eyesOpen) reason = "EYES CLOSED";
+
+      focusStatus = isFocused ? "focused" : "distracted";
 
       if (state.showLandmarks) {
         ctx.strokeStyle = "#00FF00";
@@ -332,16 +358,30 @@ export function useEyeTracker() {
       }));
     }
 
+    if (state.sessionId && Date.now() - lastLogTimeRef.current >= LOG_INTERVAL) {
+      const duration = Date.now() - focusStartTimeRef.current;
+      logFocus({
+        session_id: state.sessionId,
+        timestamp: new Date().toISOString(),
+        status: focusStatus,
+        duration_ms: duration,
+        gaze_x: gazePosition?.x,
+        gaze_y: gazePosition?.y,
+        reason: isFocused ? undefined : reason,
+      }).catch(console.error);
+
+      focusStartTimeRef.current = Date.now();
+      lastLogTimeRef.current = Date.now();
+    }
+
     const eyeStatus = earDataForDisplay.avgEar >= EYE_OPEN_THRESHOLD ? "OPEN" : "CLOSED";
     const eyeStatusColor = earDataForDisplay.avgEar >= EYE_OPEN_THRESHOLD ? "#00FF00" : "#FF0000";
-    
+
     ctx.fillStyle = eyeStatusColor;
     ctx.font = "bold 20px Arial";
     ctx.textAlign = "left";
     ctx.fillText(`EYES: ${eyeStatus} (EAR: ${earDataForDisplay.avgEar.toFixed(3)})`, 20, 80);
 
-    // Gaze direction display - inverted due to canvas flip
-    // Higher ratio = looking LEFT, Lower ratio = looking RIGHT
     const gazeDir = avgHGazeRatio > 0.55 ? "LEFT" : avgHGazeRatio < 0.45 ? "RIGHT" : "CENTER";
     ctx.fillStyle = "#FFFF00";
     ctx.font = "bold 16px Arial";
@@ -371,6 +411,13 @@ export function useEyeTracker() {
       ctx.fillText("FOCUSED", 20, 40);
     }
 
+    if (state.connected) {
+      ctx.fillStyle = "#00FF00";
+      ctx.font = "14px Arial";
+      ctx.textAlign = "right";
+      ctx.fillText("Connected", width - 20, 30);
+    }
+
     frameCountRef.current++;
     const now = Date.now();
     if (now - fpsTimeRef.current >= 1000) {
@@ -383,7 +430,7 @@ export function useEyeTracker() {
     }
 
     animationRef.current = requestAnimationFrame(processFrame);
-  }, [state.showLandmarks, state.isCalibrated, state.isDistracted, state.distractionReason]);
+  }, [state.showLandmarks, state.isCalibrated, state.isDistracted, state.distractionReason, state.sessionId, state.connected]);
 
   useEffect(() => {
     if (state.isRunning) {
